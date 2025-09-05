@@ -8,9 +8,10 @@ import websocket, json, threading, time, math, requests, logging
 from datetime import datetime
 from decimal import Decimal, getcontext, ROUND_DOWN
 from collections import defaultdict, deque
+import sys
+import subprocess
 import os
 import requests
-import random
 from typing import Dict, List
 from dotenv import load_dotenv
 
@@ -333,7 +334,7 @@ class OrderBookImbalanceMonitor:
 
         # --- baseline imbalance (range roughly -1..+1) ---
         base_obi = float((vw_bid - vw_ask) / total_liquidity)
-        imbalance_ratio = float(vw_bid / total_liquidity)
+        imbalance_ratio = float(vw_bid / (vw_bid + vw_ask))
 
         # --- compute velocity (log-return per second) on vw_bid/vw_ask ---
         now = time.time()
@@ -649,7 +650,7 @@ class OrderBookImbalanceMonitor:
         if total_liquidity < float(self.min_liquidity_usd):
             return
         
-        if abs(obi) < 0.4:  # Weak signal
+        if abs(obi) < 0.38:  # Weak signal. Chnanged from 0.4 to 0.38
             return
         
         # STEP 1: Build individual exchange signals
@@ -816,12 +817,12 @@ class OrderBookImbalanceMonitor:
         }
     def validate_with_aggregated_trade_flow(self, direction, exchange_signals, lookback_seconds=30):
         """
-        Validate using AGGREGATED trade flow across all exchanges.
-        This is much harder to manipulate than individual order books.
+        Enhanced validation using AGGREGATED trade flow with adaptive thresholds.
+        Catches signals earlier while reducing false positives through dynamic baseline.
         """
         now = time.time()
-
-        # Initialize return structure with defaults
+        
+        # Initialize return structure (SAME as original - backward compatible)
         result = {
             'passes_validation': False,
             'confirming_exchanges': [],
@@ -832,14 +833,29 @@ class OrderBookImbalanceMonitor:
             'trade_count': 0,
             'buy_percentage': 0.0,
             'sell_percentage': 0.0,
-            'reason': 'unknown'
+            'reason': 'unknown',
+            'confidence': 0.0,
+            'method': 'enhanced'
         }
         
-        # Aggregate trade flow across ALL exchanges
+        # Initialize adaptive baseline tracking
+        if not hasattr(self, '_flow_baseline'):
+            self._flow_baseline = {
+                'imbalance_ema': 0.0,
+                'volume_ema': 0.0,
+                'imbalance_var': 0.01,
+                'volume_var': 1.0,
+                'samples': 0
+            }
+        
+        baseline = self._flow_baseline
+        
+        # Aggregate trade flow (SAME logic as original)
         total_buy_volume_btc = 0.0
         total_sell_volume_btc = 0.0
         total_trades = 0
         participating_exchanges = 0
+        exchange_flows = {}
         
         for exchange in ['Binance', 'Bybit', 'BitMEX', 'Deribit', 'Bitget', 'Hyperliquid']:
             if exchange not in self.recent_trades:
@@ -857,40 +873,121 @@ class OrderBookImbalanceMonitor:
                         exchange_sell += trade['volume']
                     exchange_trades += 1
             
-            if exchange_trades >= 3:  # Minimum activity threshold
+            if exchange_trades >= 2:  # LOWERED from 3 - catch earlier
                 total_buy_volume_btc += exchange_buy
                 total_sell_volume_btc += exchange_sell
                 total_trades += exchange_trades
                 participating_exchanges += 1
+                exchange_flows[exchange] = {
+                    'buy': exchange_buy, 
+                    'sell': exchange_sell,
+                    'imbalance': (exchange_buy - exchange_sell) / max(exchange_buy + exchange_sell, 0.001)
+                }
         
-        if participating_exchanges < 3 or total_trades < 15:
-            return {'passes_validation': False, 'reason': 'insufficient_trade_activity'}
+        # LOWERED minimum requirements
+        if participating_exchanges < 2 or total_trades < 8:  # Was 3 exchanges, 15 trades
+            result['reason'] = 'insufficient_trade_activity'
+            return result
         
         total_volume = total_buy_volume_btc + total_sell_volume_btc
         if total_volume == 0:
-            return {'passes_validation': False, 'reason': 'no_volume'}
+            result['reason'] = 'no_volume'
+            return result
         
-        # Calculate GLOBAL trade flow imbalance
-        global_trade_flow_imbalance = (total_buy_volume_btc - total_sell_volume_btc) / total_volume
+        # Calculate current metrics
+        current_imbalance = (total_buy_volume_btc - total_sell_volume_btc) / total_volume
+        current_volume_rate = total_volume / lookback_seconds
         
-        # Validate alignment with order book signal
+        # Update adaptive baseline with EWMA
+        alpha = 0.15  # Smooth adaptation
+        baseline['imbalance_ema'] = alpha * current_imbalance + (1 - alpha) * baseline['imbalance_ema']
+        baseline['volume_ema'] = alpha * current_volume_rate + (1 - alpha) * baseline['volume_ema']
+        
+        # Update variance estimates
+        imb_delta = current_imbalance - baseline['imbalance_ema']
+        vol_delta = current_volume_rate - baseline['volume_ema']
+        
+        baseline['imbalance_var'] = (1 - alpha) * (baseline['imbalance_var'] + alpha * imb_delta ** 2)
+        baseline['volume_var'] = (1 - alpha) * (baseline['volume_var'] + alpha * vol_delta ** 2)
+        baseline['samples'] += 1
+        
+        # Calculate z-scores for statistical significance
+        imb_std = max(0.01, baseline['imbalance_var'] ** 0.5)  # Floor at 1%
+        vol_std = max(0.1, baseline['volume_var'] ** 0.5)
+        
+        imbalance_z = (current_imbalance - baseline['imbalance_ema']) / imb_std
+        volume_z = (current_volume_rate - baseline['volume_ema']) / vol_std
+        
+        # Cross-exchange consensus strength
+        aligned_exchanges = 0
+        for exchange, flow in exchange_flows.items():
+            # Check if exchange flow aligns with overall direction
+            if direction == 'BUY' and flow['imbalance'] > 0.05:
+                aligned_exchanges += 1
+            elif direction == 'SELL' and flow['imbalance'] < -0.05:
+                aligned_exchanges += 1
+        
+        consensus_strength = aligned_exchanges / max(participating_exchanges, 1)
+        
+        # ENHANCED VALIDATION LOGIC - Multiple pathways to signal
+        confidence = 0.0
+        passes = False
+        method = 'none'
+        
+        # Path 1: Strong statistical deviation (z-score approach)
         if direction == 'BUY':
-            trade_flow_confirms = global_trade_flow_imbalance > 0.10  # 10% global buy bias minimum
+            directional_z = imbalance_z if current_imbalance > baseline['imbalance_ema'] else 0
         else:
-            trade_flow_confirms = global_trade_flow_imbalance < -0.10  # 10% global sell bias minimum
+            directional_z = -imbalance_z if current_imbalance < baseline['imbalance_ema'] else 0
         
-        if trade_flow_confirms:
-            result.update({
-                'passes_validation': True,
-                'confirming_exchanges': list(exchange_signals.keys()),  # All exchanges that had signals
-                'global_trade_flow_imbalance': global_trade_flow_imbalance,
-                'total_buy_btc': total_buy_volume_btc,
-                'total_sell_btc': total_sell_volume_btc,
-                'participating_exchanges': participating_exchanges,
-                'trade_count': total_trades,
-                'buy_percentage': (total_buy_volume_btc / total_volume) * 100,
-                'sell_percentage': (total_sell_volume_btc / total_volume) * 100
-            })
+        if directional_z >= 1.0  and volume_z >= 0.5:  # Strong statistical signal. Changed from 1.5 to 1.0
+            confidence = min(0.90, 0.6 + directional_z * 0.1)
+            passes = True
+            method = 'statistical'
+        
+        # Path 2: Absolute imbalance with volume confirmation (LOWERED thresholds)
+        elif abs(current_imbalance) >= 0.06:  # 6% instead of 10%
+            if volume_z >= 0.3:  # Volume above baseline
+                confidence = min(0.85, 0.5 + abs(current_imbalance) * 5)  # Scale confidence
+                passes = True
+                method = 'absolute_volume'
+        
+        # Path 3: Cross-exchange consensus (NEW pathway)
+        elif consensus_strength >= 0.6 and abs(current_imbalance) >= 0.04:  # 60% exchanges agree, 4% imbalance
+            confidence = 0.7 + consensus_strength * 0.15
+            passes = True
+            method = 'consensus'
+        
+        # Path 4: Volume spike with modest imbalance (Early detection)
+        elif volume_z >= 2.0 and abs(current_imbalance) >= 0.03:  # Volume spike, 3% imbalance
+            confidence = min(0.75, 0.5 + volume_z * 0.1)
+            passes = True
+            method = 'volume_spike'
+        
+        # Final directional validation
+        if passes:
+            if direction == 'BUY' and current_imbalance <= 0:
+                passes = False
+                method = 'directional_mismatch'
+            elif direction == 'SELL' and current_imbalance >= 0:
+                passes = False  
+                method = 'directional_mismatch'
+        
+        # Update result structure (SAME format as original)
+        result.update({
+            'passes_validation': passes,
+            'confirming_exchanges': list(exchange_signals.keys()) if passes else [],
+            'global_trade_flow_imbalance': current_imbalance,
+            'total_buy_btc': total_buy_volume_btc,
+            'total_sell_btc': total_sell_volume_btc,
+            'participating_exchanges': participating_exchanges,
+            'trade_count': total_trades,
+            'buy_percentage': (total_buy_volume_btc / total_volume) * 100,
+            'sell_percentage': (total_sell_volume_btc / total_volume) * 100,
+            'confidence': confidence,
+            'method': method,
+            'reason': method if passes else 'thresholds_not_met'
+        })
         
         return result
 
@@ -934,28 +1031,13 @@ class OrderBookImbalanceMonitor:
             self.running = False
             time.sleep(2)
 
-            # Restart the entire script - CORRECTED VERSION
-            import sys
-            import subprocess
-            import os
+         
 
             try:
-                # Get the current script path
-                script_path = os.path.abspath(__file__)
-                
-                # Start new process BEFORE exiting current one
-                new_process = subprocess.Popen(
-                    [sys.executable, script_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True  # Detach from current process
-                )
-                
-                logger.info(f"New process started with PID: {new_process.pid}")
-                time.sleep(1)  # Brief delay to ensure new process starts
                 
                 # Now exit current process
-                os._exit(0)  # Force exit without cleanup (sys.exit can be caught)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+                logger.info("Restarting script via process replacement...")
                 
             except Exception as e:
                 logger.error(f"Restart failed: {e}")
@@ -965,6 +1047,16 @@ class OrderBookImbalanceMonitor:
     
     def setup_binance(self):
         """Binance Futures WebSocket with proper snapshot sync (FIXED)"""
+        
+        def apply_update(data):
+            book = self.order_books['Binance']
+            if not book["synced"]:
+                self.binance_buffer.append(data)
+                return
+            
+            U, u = data.get('U', 0), data.get('u', 0)
+            current_pu = data.get('pu', None)
+            
         def get_snapshot():
             try:
                 resp = requests.get(
@@ -1017,14 +1109,7 @@ class OrderBookImbalanceMonitor:
         for buffered_data in buffered_events:
             apply_update(buffered_data)
             
-        def apply_update(data):
-            book = self.order_books['Binance']
-            if not book["synced"]:
-                self.binance_buffer.append(data)
-                return
-            
-            U, u = data.get('U', 0), data.get('u', 0)
-            current_pu = data.get('pu', None)
+        
 
         def on_message(ws, message):
             try:
